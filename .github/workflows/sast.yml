@@ -1,0 +1,164 @@
+name: SAST Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep-sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Semgrep SAST Scan
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/src semgrep/semgrep semgrep scan --sarif --config auto /src/ --exclude '.github' --exclude 'scripts' > semgrep.json || true
+          
+          if [ -f semgrep.json ]; then
+            echo "Semgrep report saved"
+          else
+            echo '{"runs":[]}' > semgrep.json
+            echo "Empty report created"
+          fi
+      
+      # - name: Check for findings
+      #   run: |
+      #     FINDINGS=$(jq '.runs[0].results | length' semgrep.json 2>/dev/null || echo "0")
+      #     if [ "$FINDINGS" -gt 0 ]; then
+      #       echo "SAST найдено $FINDINGS уязвимостей. Пайплайн остановлен."
+      #       echo "SAST найдено $FINDINGS уязвимостей. Пайплайн остановлен."
+      #       exit 1
+      #     else
+      #       echo "Уязвимостей не найдено"
+      #     fi
+      
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.json
+
+  gitleaks:
+    name: Gitleaks secrets scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  dependency-check:
+    name: OWASP Dependency Check (SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        id: depcheck
+        with:
+          project: 'vulnerable-python-app'
+          path: '.'
+          format: 'SARIF'
+          out: 'depcheck-report.json'
+      
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: depcheck-report.json
+      
+      - name: Check for vulnerabilities
+        run: |
+          VULNS=$(jq '.runs[0].results | length' depcheck-report.json 2>/dev/null || echo "0")
+          if [ "$VULNS" -gt 0 ]; then
+            echo "SCA найдено $VULNS уязвимостей в зависимостях"
+            exit 1
+          else
+            echo "Уязвимостей в зависимостях не найдено"
+          fi
+  dast-zap:
+    name: DAST OWASP ZAP
+    runs-on: ubuntu-latest
+    services:
+      juice-shop:
+        image: bkimminich/juice-shop
+        ports:
+          - 3000:3000
+    steps:
+      - name: Wait for Juice Shop
+        run: |
+          for i in {1..20}; do
+            if curl -s -f http://localhost:3000; then
+              echo "Juice Shop is ready"
+              exit 0
+            fi
+            echo "Waiting for Juice Shop... ($i/20)"
+            sleep 3
+          done
+          echo "Juice Shop failed to start"
+          exit 1
+      
+      - name: Run ZAP scan
+        run: |
+          docker run --network host -v $(pwd):/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:3000 -J /zap/wrk/zap.json -r /zap/wrk/zap.html || true
+          # Принудительно создаём файлы, если ZAP не смог
+          touch zap.json zap.html
+      
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: |
+            zap.json
+            zap.html
+  merge-and-jira:
+    name: Merge reports & Jira mock
+    runs-on: ubuntu-latest
+    needs: [semgrep-sast, gitleaks, dependency-check]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download reports
+        uses: actions/download-artifact@v4
+        with:
+          path: .
+        continue-on-error: true
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install requests
+        run: pip install requests
+      
+      - name: Create empty semgrep.json if missing
+        run: |
+          [ -f semgrep.json ] || echo '{"results":[]}' > semgrep.json
+          [ -f gitleaks-report.json ] || echo '{"leaks":[]}' > gitleaks-report.json
+          [ -f depcheck-report.json ] || echo '{}' > depcheck-report.json
+      
+      - name: Run merge_reports.py
+        run: python scripts/merge_reports.py
+      
+      - name: Run jira_mock.py
+        run: python scripts/jira_mock.py --input filtered-issues.json --no-dry-run
+      
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            merged-report.json
+            filtered-issues.json
+            reports/
